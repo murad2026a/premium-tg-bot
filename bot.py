@@ -1,472 +1,342 @@
-from pyodide.http import pyfetch
-import json
 import asyncio
-import time
-import urllib.parse
+import json
+import random
+import string
+import re
+import os
+import aiohttp
+from aiohttp import web
 
-# ================= কনফিগারেশন =================
-BOT_TOKEN = "8631547598:AAEtZkJKYxN6JOp-qWG8TM99QSelezHeV-4"
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-ADMIN_ID = 5578674054
-BOT_USERNAME = "BdView2026te_bot" 
+# ⚠️ আপনার বট টোকেন (Render Environment Variable থেকে নিবে, না থাকলে ডিফল্ট টোকেন ব্যবহার করবে)
+TOKEN = os.environ.get("BOT_TOKEN", "8633261962:AAGKeQhtSoIApD283SpLf8B1xoD_BJoGefw")
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# 🟢 আপনার ব্লগস্পট অ্যাড শো করার লিংক
-WEB_APP_URL = "https://bjkbnbb577787787.blogspot.com/?m=1"
+# Mail.tm API Base URL
+MAIL_API = "https://api.mail.tm"
 
-# ================= ফায়ারবেস কনফিগারেশন =================
-FIREBASE_DB_URL = "https://earning-36434-default-rtdb.firebaseio.com"
+# ইউজারদের ডেটা সংরক্ষণের জন্য ডিকশনারি 
+users_db = {}
+offset = 0
 
-users_db = set() 
-videos_db = []   
-admin_states = {} 
+# ==========================================
+# 🌐 API Helper Function (pyfetch এর বিকল্প)
+# ==========================================
+async def make_request(url, method="GET", headers=None, payload=None):
+    async with aiohttp.ClientSession() as session:
+        if method == "GET":
+            async with session.get(url, headers=headers) as response:
+                return await response.json() if response.status != 204 else None
+        elif method == "POST":
+            async with session.post(url, headers=headers, json=payload) as response:
+                return await response.json() if response.status != 204 else None
+        elif method == "DELETE":
+            async with session.delete(url, headers=headers) as response:
+                return await response.text() if response.status != 204 else None
 
-# ================= ফায়ারবেস API ফাংশনস =================
-async def firebase_get_users():
-    url = f"{FIREBASE_DB_URL}/users.json"
-    try:
-        response = await pyfetch(url, method="GET")
-        if response.status == 200:
-            data = await response.json()
-            if not data:
-                return set()
-            if isinstance(data, dict):
-                return set(int(k) for k in data.keys() if k.isdigit())
-            elif isinstance(data, list):
-                return set(int(v) for v in data if v is not None)
-    except Exception as e:
-        print(f"⚠️ [Firebase Load Users Error]: {e}")
-    return set()
-
-async def firebase_save_user(chat_id):
-    url = f"{FIREBASE_DB_URL}/users/{chat_id}.json"
-    try:
-        await pyfetch(url, method="PUT", headers={"Content-Type": "application/json"}, body=json.dumps(True))
-    except Exception as e:
-        print(f"⚠️ [Firebase Save User Error]: {e}")
-
-async def firebase_get_videos():
-    url = f"{FIREBASE_DB_URL}/videos.json"
-    try:
-        response = await pyfetch(url, method="GET")
-        if response.status == 200:
-            data = await response.json()
-            if not data:
-                return []
-            if isinstance(data, dict):
-                return list(data.values())
-            elif isinstance(data, list):
-                return [v for v in data if v is not None]
-    except Exception as e:
-        print(f"⚠️ [Firebase Load Videos Error]: {e}")
-    return []
-
-async def firebase_save_video(video):
-    url = f"{FIREBASE_DB_URL}/videos/{video['id']}.json"
-    try:
-        await pyfetch(url, method="PUT", headers={"Content-Type": "application/json"}, body=json.dumps(video))
-    except Exception as e:
-        print(f"⚠️ [Firebase Save Video Error]: {e}")
-
-async def firebase_delete_video(video_id):
-    url = f"{FIREBASE_DB_URL}/videos/{video_id}.json"
-    try:
-        await pyfetch(url, method="DELETE")
-    except Exception as e:
-        print(f"⚠️ [Firebase Delete Video Error]: {e}")
-
-# ================= TELEGRAM API ফাংশন =================
-async def telegram_api_call(method, payload=None):
-    url = BASE_URL + method
-    headers = {"Content-Type": "application/json"}
-    try:
-        if payload:
-            response = await pyfetch(url, method="POST", headers=headers, body=json.dumps(payload))
-        else:
-            response = await pyfetch(url, method="GET")
-        
-        res_json = await response.json()
-        if response.status == 200:
-            return res_json
-        else:
-            print(f"❌ [Telegram API Error ({method})]: {res_json.get('description', 'Unknown Error')}")
-    except Exception as e:
-        print(f"⚠️ [Network Error ({method})]: {e}")
-    return None
-
-# ================= হেল্পার ফাংশনস =================
-def get_admin_keyboard():
+# সুন্দর কি-বোর্ড ডিজাইন
+def get_reply_keyboard():
     return {
-        "keyboard": [[{"text": "📤 POST Video"}]],
-        "resize_keyboard": True,
+        "keyboard": [
+            [{"text": "✨ Generate New Mail"}, {"text": "📥 Inbox"}],
+            [{"text": "👤 Profile"}, {"text": "🗑️ Delete Mail"}]
+        ],
+        "resize_keyboard": True, 
         "is_persistent": True
     }
 
-async def broadcast_to_users(video_info):
-    print(f"📢 ব্রডকাস্ট শুরু হচ্ছে... টার্গেট ইউজার: {len(users_db)} জন।")
-    for user_id in list(users_db):
-        if int(user_id) != int(ADMIN_ID):
-            asyncio.create_task(send_video_post(user_id, video_info, is_admin=False))
-
-async def send_video_post(chat_id, video, is_admin=False):
-    if not video or not isinstance(video, dict):
-        return
-        
-    vid_id = video.get('id', '')
-    title = video.get('title', 'No Title')
-    desc = video.get('desc', 'No Description')
-    thumb_id = video.get('thumb_id', '')
-    video_file_id = video.get('video_id', '')
-    likes = video.get('likes', 0)
-
-    if not thumb_id:
-        return
-
-    caption = f"🎬 <b>{title}</b>\n\n📄 {desc}"
-    
-    if is_admin:
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "🗑️ Delete Video", "callback_data": f"del_{vid_id}"},
-                    {"text": f"👍 {likes}", "callback_data": f"like_{vid_id}"}
-                ]
-            ]
-        }
-    else:
-        url_separator = "&" if "?" in WEB_APP_URL else "?"
-        final_web_url = f"{WEB_APP_URL}{url_separator}chat_id={chat_id}&file_id={video_file_id}"
-
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "🔓 Unlock Video 🔓", "web_app": {"url": final_web_url}},
-                    {"text": f"👍 {likes}", "callback_data": f"like_{vid_id}"}
-                ]
-            ]
-        }
-
-    res = await telegram_api_call("sendPhoto", {
-        "chat_id": chat_id,
-        "photo": thumb_id,
-        "caption": caption,
+# মেসেজ পাঠানোর ফাংশন
+async def send_message(chat_id, text, reply_markup=None):
+    url = BASE_URL + "sendMessage"
+    payload = {
+        "chat_id": chat_id, 
+        "text": text, 
         "parse_mode": "HTML",
-        "reply_markup": keyboard
-    })
-    
-    if res and res.get("ok"):
-        msg_id = res["result"]["message_id"]
-        url = f"{FIREBASE_DB_URL}/msg_tracks/{chat_id}_{video_file_id}.json"
-        await pyfetch(url, method="PUT", headers={"Content-Type": "application/json"}, body=json.dumps(msg_id))
+        "disable_web_page_preview": True
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+        
+    return await make_request(url, method="POST", payload=payload)
 
-# ================= অটো-ডেলিভারি এবং টাইমার ফাংশনস =================
-async def check_ad_unlock_requests():
-    """অ্যাড দেখার পর ভিডিও আনলক করার প্রক্রিয়া"""
+# মেসেজ এডিট করার ফাংশন
+async def edit_message_text(chat_id, message_id, text, reply_markup=None):
+    url = BASE_URL + "editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+        
+    await make_request(url, method="POST", payload=payload)
+
+# ব্যাকগ্রাউন্ডে লোডিং অ্যানিমেশন চালানোর ফাংশন
+async def loading_animation(chat_id, message_id):
+    loading_text = "⏳ <i>নতুন ইমেইল তৈরি করা হচ্ছে...</i>\n\n"
+    frames = [
+        f"{loading_text}[🟥 ⬜ ⬜ ⬜ ⬜]",
+        f"{loading_text}[🟥 🟧 ⬜ ⬜ ⬜]",
+        f"{loading_text}[🟥 🟧 🟨 ⬜ ⬜]",
+        f"{loading_text}[🟥 🟧 🟨 🟩 ⬜]",
+        f"{loading_text}[🟥 🟧 🟨 🟩 🟦]"
+    ]
+    idx = 0
     while True:
         try:
-            url = f"{FIREBASE_DB_URL}/unlock_requests.json"
-            response = await pyfetch(url, method="GET")
-            if response.status == 200:
-                requests = await response.json()
-                if requests and isinstance(requests, dict):
-                    for req_id, req_data in requests.items():
-                        chat_id = req_data.get("chat_id")
-                        file_id = req_data.get("file_id")
-                        
-                        if chat_id and file_id:
-                            print(f"🚀 Unlocking Video -> User: {chat_id}, File: {file_id}")
-                            
-                            track_url = f"{FIREBASE_DB_URL}/msg_tracks/{chat_id}_{file_id}.json"
-                            track_resp = await pyfetch(track_url, method="GET")
-                            
-                            video_item = next((v for v in videos_db if v["video_id"] == file_id), None)
-                            v_id = video_item["id"] if video_item else str(int(time.time()))
-                            title = video_item["title"] if video_item else "Premium Video"
-                            desc = video_item["desc"] if video_item else ""
-                            likes = video_item["likes"] if video_item else 0
-                            
-                            share_text = urllib.parse.quote(f"🔥 চমৎকার এই ভিডিওটি দেখুন সম্পূর্ণ ফ্রিতে! 👇\n\nt.me/{BOT_USERNAME}?start=video_{v_id}")
-                            share_url = f"https://t.me/share/url?url=https://t.me/{BOT_USERNAME}&text={share_text}"
-                            
-                            unlocked_keyboard = {
-                                "inline_keyboard": [
-                                    [
-                                        {"text": f"👍 {likes}", "callback_data": f"like_{v_id}"},
-                                        {"text": "📢 Share Video", "url": share_url}
-                                    ]
-                                ]
-                            }
-                            
-                            caption_text = f"🎬 <b>{title}</b>\n\n📄 {desc}\n\n🎉 <i>ভিডিওটি আনলক করা হয়েছে (১৫ মিনিট পর পুনরায় লক হয়ে যাবে)।</i>"
+            await edit_message_text(chat_id, message_id, frames[idx % len(frames)])
+            idx += 1
+            # টেলিগ্রামের রেট লিমিট এড়াতে ১.২ সেকেন্ড দেওয়া হলো
+            await asyncio.sleep(1.2) 
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(1.2)
 
-                            if track_resp.status == 200 and track_resp.text:
-                                msg_id = await track_resp.json()
-                                if msg_id:
-                                    # থাম্বনেইল পরিবর্তন করে ভিডিও বসানো হচ্ছে
-                                    await telegram_api_call("editMessageMedia", {
-                                        "chat_id": chat_id,
-                                        "message_id": int(msg_id),
-                                        "media": {
-                                            "type": "video",
-                                            "media": file_id,
-                                            "caption": caption_text,
-                                            "parse_mode": "HTML"
-                                        },
-                                        "reply_markup": unlocked_keyboard
-                                    })
-                                    
-                                    # 🟢 ১৫ মিনিটের টাইমারের জন্য রেকর্ড ফায়ারবেসে সেভ করা হচ্ছে
-                                    unlock_record = {
-                                        "chat_id": chat_id,
-                                        "message_id": int(msg_id),
-                                        "file_id": file_id,
-                                        "unlock_time": time.time()
-                                    }
-                                    await pyfetch(f"{FIREBASE_DB_URL}/active_unlocks/{chat_id}_{file_id}.json", method="PUT", headers={"Content-Type": "application/json"}, body=json.dumps(unlock_record))
-                                    
-                                    # পুরনো ট্র্যাক মুছে ফেলা
-                                    await pyfetch(track_url, method="DELETE")
-                                    await pyfetch(f"{FIREBASE_DB_URL}/unlock_requests/{req_id}.json", method="DELETE")
-                                    continue
-                            
-                            # প্রসেসড রিকোয়েস্টটি ফায়ারবেস থেকে ডিলিট
-                            await pyfetch(f"{FIREBASE_DB_URL}/unlock_requests/{req_id}.json", method="DELETE")
-        except Exception as e:
-            pass
-        await asyncio.sleep(2)
+# ==========================================
+# ✉️ Mail.tm API Helpers 
+# ==========================================
+async def get_domain():
+    data = await make_request(f"{MAIL_API}/domains", method="GET")
+    return data["hydra:member"][0]["domain"]
 
-async def check_expired_unlocks():
-    """১৫ মিনিট (৯০০ সেকেন্ড) পর ভিডিও পুনরায় লক করার প্রক্রিয়া"""
-    while True:
-        try:
-            url = f"{FIREBASE_DB_URL}/active_unlocks.json"
-            response = await pyfetch(url, method="GET")
-            if response.status == 200:
-                unlocks = await response.json()
-                if unlocks and isinstance(unlocks, dict):
-                    current_time = time.time()
-                    for key, record in unlocks.items():
-                        chat_id = record.get("chat_id")
-                        msg_id = record.get("message_id")
-                        file_id = record.get("file_id")
-                        unlock_time = record.get("unlock_time", 0)
-                        
-                        # 🟢 ৯০০ সেকেন্ড = ১৫ মিনিট
-                        if current_time - unlock_time >= 900:
-                            print(f"🔒 Relocking Video -> User: {chat_id}, File: {file_id}")
-                            
-                            video = next((v for v in videos_db if v["video_id"] == file_id), None)
-                            if video:
-                                v_id = video["id"]
-                                title = video.get("title", "Premium Video")
-                                desc = video.get("desc", "")
-                                thumb_id = video.get("thumb_id", "")
-                                likes = video.get("likes", 0)
-                                
-                                caption = f"🎬 <b>{title}</b>\n\n📄 {desc}\n\n🔒 <i>সময় শেষ! ভিডিওটি পুনরায় লক হয়ে গেছে। আবার দেখতে আনলক করুন।</i>"
-                                
-                                url_separator = "&" if "?" in WEB_APP_URL else "?"
-                                final_web_url = f"{WEB_APP_URL}{url_separator}chat_id={chat_id}&file_id={file_id}"
-                                
-                                locked_keyboard = {
-                                    "inline_keyboard": [
-                                        [
-                                            {"text": "🔓 Unlock Video 🔓", "web_app": {"url": final_web_url}},
-                                            {"text": f"👍 {likes}", "callback_data": f"like_{v_id}"}
-                                        ]
-                                    ]
-                                }
-                                
-                                # ভিডিওটিকে পরিবর্তন করে পুনরায় থাম্বনেইল ফটো বসানো হচ্ছে
-                                await telegram_api_call("editMessageMedia", {
-                                    "chat_id": chat_id,
-                                    "message_id": int(msg_id),
-                                    "media": {
-                                        "type": "photo",
-                                        "media": thumb_id,
-                                        "caption": caption,
-                                        "parse_mode": "HTML"
-                                    },
-                                    "reply_markup": locked_keyboard
-                                })
-                                
-                                # আবার আনলক করার জন্য ট্র্যাক হিস্টোরি রিস্টোর করা হচ্ছে
-                                track_url = f"{FIREBASE_DB_URL}/msg_tracks/{chat_id}_{file_id}.json"
-                                await pyfetch(track_url, method="PUT", headers={"Content-Type": "application/json"}, body=json.dumps(msg_id))
-                            
-                            # ১৫ মিনিট পার হয়ে যাওয়ার পর টাইমার লিস্ট থেকে মুছে ফেলা
-                            await pyfetch(f"{FIREBASE_DB_URL}/active_unlocks/{key}.json", method="DELETE")
-        except Exception as e:
-            pass
-        await asyncio.sleep(5)
-
-# ================= মূল আপডেট হ্যান্ডলার =================
-async def process_message(msg):
-    global videos_db
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "")
+async def create_account():
+    domain = await get_domain()
+    username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+    email = f"{username}@{domain}"
     
-    if chat_id not in users_db:
-        users_db.add(chat_id)
-        asyncio.create_task(firebase_save_user(chat_id))
+    payload = {"address": email, "password": password}
+    
+    acc_data = await make_request(f"{MAIL_API}/accounts", method="POST", payload=payload)
+    account_id = acc_data["id"]
+    
+    auth_data = await make_request(f"{MAIL_API}/token", method="POST", payload=payload)
+    token = auth_data["token"]
+    
+    return account_id, email, token
 
-    if text.startswith("/start"):
-        if chat_id == ADMIN_ID:
-            await telegram_api_call("sendMessage", {
-                "chat_id": chat_id,
-                "text": "👨‍💻 <b>স্বাগতম অ্যাডমিন!</b>\nনিচের <b>POST Video</b> বাটনে ক্লিক করে নতুন ভিডিও আপলোড করুন।",
-                "parse_mode": "HTML",
-                "reply_markup": get_admin_keyboard()
-            })
-        else:
-            await telegram_api_call("sendMessage", {
-                "chat_id": chat_id,
-                "text": "🌟 <b>স্বাগতম!</b>\nএখানে আমাদের সব প্রিমিয়াম ভিডিও দেওয়া আছে।",
-                "parse_mode": "HTML",
-                "reply_markup": {"remove_keyboard": True}
-            })
+async def fetch_inbox(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    data = await make_request(f"{MAIL_API}/messages", method="GET", headers=headers)
+    return data.get("hydra:member", [])
+
+async def read_message(msg_id, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    return await make_request(f"{MAIL_API}/messages/{msg_id}", method="GET", headers=headers)
+
+async def delete_account_api(account_id, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    await make_request(f"{MAIL_API}/accounts/{account_id}", method="DELETE", headers=headers)
+
+# ==========================================
+# 🤖 Telegram Bot Handlers
+# ==========================================
+async def handle_message(message):
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
+    user_name = message["from"].get("first_name", "User")
+    user_id = message["from"]["id"]
+    
+    if user_id not in users_db:
+        users_db[user_id] = {"name": user_name, "id": None, "email": None, "token": None}
+    
+    if text == "/start":
+        welcome_text = (
+            f"✨ <b>স্বাগতম {user_name}!</b> ✨\n\n"
+            "🛡️ এটি একটি প্রিমিয়াম <b>Temp Mail Bot</b>।\n"
+            "এখানে আপনি আনলিমিটেড টেম্পোরারি ইমেইল তৈরি করতে পারবেন।\n\n"
+            "👇 <b>নিচের মেনু থেকে অপশন বেছে নিন:</b>"
+        )
+        await send_message(chat_id, welcome_text, get_reply_keyboard())
+        
+    elif text == "✨ Generate New Mail":
+        msg_res = await send_message(chat_id, "⏳ <i>নতুন ইমেইল তৈরি করা হচ্ছে...</i>\n\n[⬜ ⬜ ⬜ ⬜ ⬜]")
+        msg_id = None
+        anim_task = None
+        
+        if msg_res and msg_res.get("ok"):
+            msg_id = msg_res["result"]["message_id"]
+            anim_task = asyncio.create_task(loading_animation(chat_id, msg_id))
             
-            if "_" in text:
-                target_id = text.split("_")[1]
-                specific_video = next((v for v in videos_db if v["id"] == target_id), None)
-                if specific_video:
-                    await send_video_post(chat_id, specific_video, is_admin=False)
-                    return
+        try:
+            old_data = users_db.get(user_id)
+            if old_data and old_data.get("id"):
+                try:
+                    await delete_account_api(old_data["id"], old_data["token"])
+                except:
+                    pass
+
+            account_id, email, token = await create_account()
             
-            if not videos_db:
-                await telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "এখনো কোনো ভিডিও আপলোড করা হয়নি।"})
+            users_db[user_id]["id"] = account_id
+            users_db[user_id]["email"] = email
+            users_db[user_id]["token"] = token
+            
+            mail_text = (
+                "🎉 <b>সফলভাবে ইমেইল তৈরি হয়েছে!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📧 <b>ইমেইল:</b> <code>{email}</code>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "💡 <i>(কপি করতে ইমেইলের উপর ক্লিক করুন)</i>"
+            )
+            
+            if anim_task:
+                anim_task.cancel()
+                
+            if msg_id:
+                await edit_message_text(chat_id, msg_id, mail_text)
             else:
-                for video in videos_db:
-                    await send_video_post(chat_id, video, is_admin=False)
-        return
-
-    if chat_id == ADMIN_ID:
-        if text in ["📤 POST Video", "POST Video"]:
-            admin_states[chat_id] = {"step": "title"}
-            await telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "📝 <b>ধাপ ১:</b> ভিডিওর Title (নাম) দিন:", "parse_mode": "HTML"})
+                await send_message(chat_id, mail_text)
+                
+        except Exception as e:
+            if anim_task:
+                anim_task.cancel()
+            error_text = "⚠️ <b>দুঃখিত!</b> ইমেইল তৈরি করতে সমস্যা হচ্ছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
+            if msg_id:
+                await edit_message_text(chat_id, msg_id, error_text)
+            else:
+                await send_message(chat_id, error_text)
+            
+    elif text == "📥 Inbox":
+        user_data = users_db.get(user_id)
+        if not user_data or not user_data.get("token"):
+            await send_message(chat_id, "⚠️ <b>আপনার কোনো ইমেইল নেই!</b>\nআগে '✨ Generate New Mail' এ ক্লিক করুন।")
             return
             
-        state = admin_states.get(chat_id)
-        if state:
-            if state["step"] == "title" and text:
-                state["title"] = text
-                state["step"] = "desc"
-                await telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "📄 <b>ধাপ ২:</b> ভিডিওর Description (বর্ণনা) দিন:", "parse_mode": "HTML"})
-            
-            elif state["step"] == "desc" and text:
-                state["desc"] = text
-                state["step"] = "thumb"
-                await telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "🖼️ <b>ধাপ ৩:</b> ভিডিওর Thumbnail (ছবি) পাঠান:", "parse_mode": "HTML"})
-            
-            elif state["step"] == "thumb" and "photo" in msg:
-                photo_id = msg["photo"][-1]["file_id"]
-                state["thumb_id"] = photo_id
-                state["step"] = "video"
-                await telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "🎥 <b>ধাপ ৪:</b> এবার মূল Video টি পাঠান:", "parse_mode": "HTML"})
-            
-            elif state["step"] == "video" and "video" in msg:
-                video_id = msg["video"]["file_id"]
-                video_uid = str(int(time.time() * 1000))
+        await send_message(chat_id, "🔄 <i>ইনবক্স চেক করা হচ্ছে...</i>")
+        try:
+            messages = await fetch_inbox(user_data["token"])
+            if not messages:
+                await send_message(chat_id, "📭 <b>আপনার ইনবক্স ফাঁকা।</b>\nএখনো কোনো নতুন মেইল আসেনি।")
+            else:
+                latest_msg_id = messages[0]['id']
+                msg_details = await read_message(latest_msg_id, user_data["token"])
                 
-                new_video = {
-                    "id": video_uid, 
-                    "title": state["title"],
-                    "desc": state["desc"],
-                    "thumb_id": state["thumb_id"],
-                    "video_id": video_id,
-                    "likes": 0,
-                    "liked_by": []
-                }
+                sender = msg_details.get('from', {}).get('address', 'Unknown')
+                subject = msg_details.get('subject', 'No Subject')
+                body = msg_details.get('text', 'No Content available in text format.')
+                date = msg_details.get('createdAt', '')[:19].replace("T", " ")
                 
-                videos_db.append(new_video)
-                asyncio.create_task(firebase_save_video(new_video))
+                code_match = re.search(r'\b\d{4,8}\b', subject)
+                if not code_match:
+                    code_match = re.search(r'\b\d{4,8}\b', body)
                 
-                if chat_id in admin_states:
-                    del admin_states[chat_id] 
-                
-                await telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "✅ <b>ভিডিও সফলভাবে আপলোড ও ডেটাবেসে সেভ হয়েছে!</b>", "parse_mode": "HTML"})
-                await send_video_post(chat_id, new_video, is_admin=True)
-                await broadcast_to_users(new_video)
+                reply_markup = None
+                if code_match:
+                    extracted_code = code_match.group(0)
+                    reply_markup = {
+                        "inline_keyboard": [
+                            [{"text": f"📋 Copy Code: {extracted_code}", "copy_text": {"text": extracted_code}}]
+                        ]
+                    }
 
-# ================= কলব্যাক হ্যান্ডলার =================
-async def process_callback(cq):
-    global videos_db 
-    chat_id = cq["message"]["chat"]["id"]
-    message_id = cq["message"]["message_id"]
-    data = cq["data"]
-    callback_id = cq["id"]
-    
-    if data.startswith("like_"):
-        vid_id = data.split("_")[1]
-        video = next((v for v in videos_db if v["id"] == vid_id), None)
-        if video:
-            liked_by = video.get('liked_by', [])
-            if not isinstance(liked_by, list):
-                liked_by = []
+                if len(body) > 1000:
+                    body = body[:1000] + "\n\n... [Message Truncated] ..."
+                
+                reply_text = (
+                    "📬 <b>নতুন ইমেইল পাওয়া গেছে!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 <b>From:</b> <code>{sender}</code>\n"
+                    f"🏷 <b>Subject:</b> <b>{subject}</b>\n"
+                    f"🕒 <b>Date:</b> {date}\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📝 <b>Message:</b>\n<pre>{body}</pre>"
+                )
+                await send_message(chat_id, reply_text, reply_markup)
+                
+        except Exception as e:
+            await send_message(chat_id, "⚠️ <b>দুঃখিত!</b> সার্ভার ইনবক্স ফেচ করতে ব্যর্থ হয়েছে।")
             
-            if chat_id != ADMIN_ID and chat_id in liked_by:
-                await telegram_api_call("answerCallbackQuery", {
-                    "callback_query_id": callback_id, 
-                    "text": "❌ আপনি ইতিমধ্যে এই ভিডিওটি লাইক করেছেন!",
-                    "show_alert": True
-                })
-                return
-            
-            video['likes'] = video.get('likes', 0) + 1
-            if chat_id != ADMIN_ID:
-                liked_by.append(chat_id)
-            video['liked_by'] = liked_by
-            
-            asyncio.create_task(firebase_save_video(video))
-            await telegram_api_call("answerCallbackQuery", {"callback_query_id": callback_id, "text": "❤️ আপনি ভিডিওটি লাইক করেছেন!"})
-            
-            current_keyboard = cq["message"]["reply_markup"]
-            for row in current_keyboard["inline_keyboard"]:
-                for btn in row:
-                    if btn.get("callback_data") == data:
-                        btn["text"] = f"👍 {video['likes']}"
-            
-            await telegram_api_call("editMessageReplyMarkup", {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "reply_markup": current_keyboard
-            })
-
-    elif data.startswith("del_") and chat_id == ADMIN_ID:
-        vid_id = data.split("_")[1]
-        videos_db = [v for v in videos_db if v["id"] != vid_id]
-        asyncio.create_task(firebase_delete_video(vid_id))
+    elif text == "👤 Profile":
+        user_email = users_db[user_id].get("email")
+        if user_email:
+            profile_text = (
+                "👤 <b>আপনার প্রোফাইল:</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 <b>নাম:</b> {user_name}\n"
+                f"🔹 <b>বর্তমান ইমেইল:</b> <code>{user_email}</code>\n"
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
+        else:
+            profile_text = (
+                "👤 <b>আপনার প্রোফাইল:</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔹 <b>নাম:</b> {user_name}\n"
+                "🔹 <b>বর্তমান ইমেইল:</b> ❌ <i>নাই</i>\n"
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
+        await send_message(chat_id, profile_text)
         
-        await telegram_api_call("answerCallbackQuery", {"callback_query_id": callback_id, "text": "✅ ভিডিও ডিলেট করা হয়েছে!"})
-        await telegram_api_call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    elif text == "🗑️ Delete Mail":
+        user_data = users_db.get(user_id)
+        if user_data and user_data.get("id"):
+            try:
+                await delete_account_api(user_data["id"], user_data["token"])
+            except Exception as e:
+                pass
+            
+            users_db[user_id]["id"] = None
+            users_db[user_id]["email"] = None
+            users_db[user_id]["token"] = None
+            
+            await send_message(chat_id, "🗑️ <b>আপনার বর্তমান ইমেইল সার্ভার থেকে সফলভাবে ডিলিট করা হয়েছে!</b>\nনতুন ইমেইল নিতে '✨ Generate New Mail' এ ক্লিক করুন।")
+        else:
+            await send_message(chat_id, "⚠️ আপনার কোনো অ্যাক্টিভ ইমেইল নেই যা ডিলিট করা যাবে।")
+            
+    else:
+        await send_message(chat_id, "দয়া করে নিচের মেনু থেকে সঠিক একটি অপশন বেছে নিন।", get_reply_keyboard())
 
-# ================= মূল বট লুপ =================
-async def start_bot():
-    global users_db, videos_db
-    print("✨ ব্রাউজারে টেলিগ্রাম বট সফলভাবে চালু হয়েছে...")
-    
-    users_db = await firebase_get_users()
-    raw_vids = await firebase_get_videos()
-    videos_db = [v for v in raw_vids if isinstance(v, dict) and 'id' in v]
-    
-    # 🟢 ব্যাকগ্রাউন্ডে আনলক এবং রিলক মনিটরিং টাস্কগুলো শুরু করা হলো
-    asyncio.create_task(check_ad_unlock_requests())
-    asyncio.create_task(check_expired_unlocks())
-    
-    offset = 0
-    await telegram_api_call("getUpdates", {"offset": -1})
-    
+
+# ==========================================
+# 🔄 Update Polling
+# ==========================================
+async def poll_updates():
+    global offset
+    print("Bot is polling for updates...")
     while True:
-        updates = await telegram_api_call("getUpdates", {"offset": offset, "timeout": 2})
-        if updates and updates.get("ok") and updates.get("result"):
-            for update in updates["result"]:
-                offset = update["update_id"] + 1
-                try:
-                    if "message" in update:
-                        await process_message(update["message"])
-                    elif "callback_query" in update:
-                        await process_callback(update["callback_query"])
-                except Exception as e:
-                    print(f"Error Processing Update: {e}")
+        try:
+            url = BASE_URL + f"getUpdates?offset={offset}&timeout=10"
+            data = await make_request(url, method="GET")
+            
+            if data and data.get("ok"):
+                for result in data.get("result", []):
+                    offset = result["update_id"] + 1
+                    if "message" in result:
+                        await handle_message(result["message"])
+        except Exception as e:
+            pass 
         await asyncio.sleep(1)
 
-await start_bot()
+
+# ==========================================
+# 🌍 Dummy Web Server (For Render)
+# ==========================================
+async def handle_request(request):
+    return web.Response(text="Bot is running and healthy!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_request)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render সাধারণত $PORT এনভায়রনমেন্ট ভ্যারিয়েবল প্রোভাইড করে
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
+
+# মূল রান ফাংশন
+async def main():
+    # ওয়েব সার্ভার এবং বট পোলিং একসাথে রান করানো হচ্ছে
+    await asyncio.gather(
+        start_web_server(),
+        poll_updates()
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
